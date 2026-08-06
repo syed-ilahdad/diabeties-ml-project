@@ -7,7 +7,9 @@ import streamlit as st
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
+from datetime import datetime
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -161,7 +163,8 @@ def load_data(path_or_buffer):
     return data
 
 @st.cache_resource(show_spinner=False)
-def train_model(data: pd.DataFrame):
+def train_models(data: pd.DataFrame):
+    """Train two candidate models so their accuracy can be compared side by side."""
     X = data.drop('Outcome', axis=1)
     y = data['Outcome']
 
@@ -172,11 +175,19 @@ def train_model(data: pd.DataFrame):
         X_scaled, y, test_size=0.25, random_state=42
     )
 
-    model = RandomForestClassifier(random_state=42)
-    model.fit(X_train, y_train)
-    acc = accuracy_score(y_test, model.predict(X_test))
+    rf_model = RandomForestClassifier(random_state=42)
+    rf_model.fit(X_train, y_train)
+    rf_acc = accuracy_score(y_test, rf_model.predict(X_test))
 
-    return model, scaler, acc, list(X.columns)
+    lr_model = LogisticRegression(max_iter=1000)
+    lr_model.fit(X_train, y_train)
+    lr_acc = accuracy_score(y_test, lr_model.predict(X_test))
+
+    models = {
+        "Random Forest": {"model": rf_model, "accuracy": rf_acc},
+        "Logistic Regression": {"model": lr_model, "accuracy": lr_acc},
+    }
+    return models, scaler, list(X.columns)
 
 # --- Sidebar: data source ---
 with st.sidebar:
@@ -214,9 +225,12 @@ if data_source is None:
     )
     st.stop()
 
-with st.spinner("Loading data & training model..."):
+with st.spinner("Loading data & training models..."):
     df = load_data(data_source)
-    model, scaler, acc, feature_names = train_model(df)
+    models, scaler, feature_names = train_models(df)
+
+if "history" not in st.session_state:
+    st.session_state.history = []  # each entry: dict with inputs, model, result, probability, time
 
 # =========================================================
 # MAIN LAYOUT
@@ -226,6 +240,11 @@ left, right = st.columns([1.15, 1], gap="large")
 with left:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown("### 📝 Your Health Metrics")
+
+    model_choice = st.selectbox(
+        "Model", list(models.keys()),
+        help="Compare predictions between two different classifiers trained on the same data.",
+    )
 
     c1, c2 = st.columns(2)
     with c1:
@@ -242,12 +261,20 @@ with left:
     predict_clicked = st.button("🔍 Predict My Risk")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown(
-        f'<span class="metric-chip">Model: Random Forest</span>'
-        f'<span class="metric-chip">Test Accuracy: {acc*100:.1f}%</span>'
-        f'<span class="metric-chip">Training rows: {len(df)}</span>',
-        unsafe_allow_html=True,
-    )
+    active_model = models[model_choice]["model"]
+    active_acc = models[model_choice]["accuracy"]
+
+    chips = f'<span class="metric-chip">Model: {model_choice}</span>' \
+            f'<span class="metric-chip">Test Accuracy: {active_acc*100:.1f}%</span>' \
+            f'<span class="metric-chip">Training rows: {len(df)}</span>'
+    st.markdown(chips, unsafe_allow_html=True)
+
+    with st.expander("⚖️ Compare both models' accuracy"):
+        comp_df = pd.DataFrame(
+            [{"Model": name, "Test Accuracy (%)": round(info["accuracy"] * 100, 2)}
+             for name, info in models.items()]
+        )
+        st.dataframe(comp_df, use_container_width=True, hide_index=True)
 
 with right:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -259,9 +286,19 @@ with right:
             columns=feature_names,
         )
         input_scaled = scaler.transform(input_df)
-        proba = model.predict_proba(input_scaled)[0]
+        proba = active_model.predict_proba(input_scaled)[0]
         result = int(proba[1] >= 0.5)
         risk_pct = proba[1] * 100
+
+        # Save to session history (keep only the most recent 5)
+        st.session_state.history.insert(0, {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "model": model_choice,
+            "risk_pct": risk_pct,
+            "result": "Elevated Risk" if result == 1 else "Lower Risk",
+            "inputs": input_df.iloc[0].to_dict(),
+        })
+        st.session_state.history = st.session_state.history[:5]
 
         if result == 1:
             st.markdown(f"""
@@ -292,6 +329,39 @@ with right:
     else:
         st.write("Fill in your metrics on the left and click **Predict My Risk** to see your result here.")
     st.markdown('</div>', unsafe_allow_html=True)
+
+# =========================================================
+# RECENT PREDICTIONS (session-only history, last 5)
+# =========================================================
+st.markdown('<div class="panel">', unsafe_allow_html=True)
+hist_header, hist_clear = st.columns([4, 1])
+with hist_header:
+    st.markdown("### 🕒 Your Recent Predictions (this session)")
+with hist_clear:
+    if st.session_state.history and st.button("Clear", key="clear_history"):
+        st.session_state.history = []
+        st.rerun()
+
+if not st.session_state.history:
+    st.caption("No predictions yet this session. Run a prediction above to see it logged here.")
+else:
+    hist_df = pd.DataFrame([
+        {
+            "Time": h["time"],
+            "Model": h["model"],
+            "Result": h["result"],
+            "Risk %": f'{h["risk_pct"]:.1f}%',
+            "Glucose": h["inputs"]["Glucose"],
+            "BMI": h["inputs"]["BMI"],
+            "Age": h["inputs"]["Age"],
+        }
+        for h in st.session_state.history
+    ])
+    st.dataframe(hist_df, use_container_width=True, hide_index=True)
+    st.caption(
+        "Stored only in your browser session (not saved to a database) — it resets when you close or reload the app."
+    )
+st.markdown('</div>', unsafe_allow_html=True)
 
 # =========================================================
 # DATA INSIGHTS (extra polish, optional expand)
